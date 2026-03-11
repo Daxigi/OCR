@@ -1,0 +1,96 @@
+version: "3.9"
+
+networks:
+  rag_network:
+    driver: bridge
+
+volumes:
+  ollama_data:
+  qdrant_data:
+  pdf_storage:
+
+services:
+  # ── Ollama ───────────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - rag_network
+
+  # ── Qdrant ───────────────────────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - rag_network
+
+  # ── MCP PDF Tools ─────────────────────────────────────────────────────────
+  mcp-pdf-tools:
+    build:
+      context: ./mcp-pdf-tools
+      dockerfile: Dockerfile
+    container_name: mcp-pdf-tools
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    volumes:
+      - pdf_storage:/pdfs
+    networks:
+      - rag_network
+
+  # ── MCP RAG Engine ────────────────────────────────────────────────────────
+  mcp-rag-engine:
+    build:
+      context: ./mcp-rag-engine
+      dockerfile: Dockerfile
+    container_name: mcp-rag-engine
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    environment:
+      - QDRANT_HOST=${QDRANT_HOST}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL}
+    depends_on:
+      - qdrant
+    networks:
+      - rag_network
+
+  # ── OpenClaw / AgentGateway ───────────────────────────────────────────────
+  openclaw:
+    image: agentgateway/agentgateway:latest
+    container_name: openclaw
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./openclaw-config/config.yaml:/app/config.yaml:ro
+      - pdf_storage:/pdfs
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_USER_ID=${TELEGRAM_USER_ID}
+      - OLLAMA_HOST=${OLLAMA_HOST}
+    depends_on:
+      - ollama
+      - mcp-pdf-tools
+      - mcp-rag-engine
+    networks:
+      - rag_network
+    command: ["--config", "/app/config.yaml"]

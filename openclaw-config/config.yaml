@@ -1,0 +1,60 @@
+# AgentGateway / OpenClaw configuration
+# Connects Telegram ↔ Mistral Nemo (Ollama) ↔ MCP tools
+
+version: "1"
+
+# ── LLM backend ─────────────────────────────────────────────────────────────
+llm:
+  provider: openai          # Ollama exposes an OpenAI-compatible /v1 endpoint
+  base_url: "${OLLAMA_HOST}/v1"
+  api_key: "ollama"         # Ollama does not require a real key
+  model: mistral-nemo:latest
+  temperature: 0.2
+  max_tokens: 4096
+
+# ── Telegram channel ─────────────────────────────────────────────────────────
+channels:
+  - type: telegram
+    token: "${TELEGRAM_BOT_TOKEN}"
+    # Restrict the bot to specific Telegram user IDs (comma-separated or list)
+    allowed_users:
+      - "${TELEGRAM_USER_ID}"
+
+# ── MCP tool servers ─────────────────────────────────────────────────────────
+mcp_servers:
+  - name: pdf-tools
+    transport: sse
+    url: "http://mcp-pdf-tools:8001/sse"
+    description: >
+      Provides PDF extraction capabilities: extract_text, extract_tables,
+      and analyze_document. Use these tools when the user sends or references
+      a PDF file.
+
+  - name: rag-engine
+    transport: sse
+    url: "http://mcp-rag-engine:8002/sse"
+    description: >
+      Provides RAG pipeline operations: ingest_document, search_documents,
+      list_documents, and delete_document. Use these tools to store document
+      content and answer questions based on the knowledge base.
+
+# ── Agent behaviour ──────────────────────────────────────────────────────────
+agent:
+  system_prompt: |
+    You are a helpful assistant specialised in document analysis and retrieval.
+    You have access to a set of tools:
+      - PDF tools: extract and analyse PDF documents shared by the user.
+      - RAG engine: search the knowledge base built from previously ingested
+        documents, and manage (ingest / list / delete) documents.
+
+    When a user shares a PDF file:
+      1. Use extract_text or analyze_document to read its content.
+      2. Use ingest_document to store it in the knowledge base.
+      3. Confirm to the user that the document has been indexed.
+
+    When a user asks a question:
+      1. Use search_documents to retrieve relevant context.
+      2. Answer using the retrieved context, citing the source document.
+
+    Always respond in the same language the user uses.
+  max_tool_rounds: 10
