@@ -11,9 +11,14 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import httpx
 import fitz  # PyMuPDF
 import pdfplumber
 from mcp.server.fastmcp import FastMCP
+
+TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+PDF_DIR = Path("/pdfs")
+PDF_DIR.mkdir(parents=True, exist_ok=True)
 
 mcp = FastMCP("pdf-tools")
 
@@ -161,6 +166,65 @@ def analyze_document(path: str) -> str:
     }
 
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool: download from Telegram
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def download_telegram_file(file_id: str) -> str:
+    """
+    Download a file from Telegram (by file_id) and save it to /pdfs.
+
+    Use this tool when the user sends a document via Telegram. Pass the
+    file_id exactly as received. The file is saved to /pdfs/<filename>.
+
+    Args:
+        file_id: Telegram file_id of the document.
+
+    Returns:
+        JSON string with keys:
+          - path     : absolute path where the file was saved (/pdfs/<name>)
+          - filename : original filename from Telegram
+          - size     : file size in bytes
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in the environment.")
+
+    base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+    # Step 1: resolve file_id → file_path + file_name
+    with httpx.Client(timeout=30) as client:
+        resp = client.get(f"{base}/getFile", params={"file_id": file_id})
+        resp.raise_for_status()
+        tg_file = resp.json()
+
+    if not tg_file.get("ok"):
+        raise RuntimeError(f"Telegram getFile error: {tg_file}")
+
+    file_info = tg_file["result"]
+    tg_path: str = file_info["file_path"]          # e.g. "documents/file_123.pdf"
+    file_size: int = file_info.get("file_size", 0)
+
+    # Use the last component of the Telegram path as filename
+    filename = Path(tg_path).name
+    dest_path = PDF_DIR / filename
+
+    # Step 2: download the actual bytes
+    download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{tg_path}"
+    with httpx.Client(timeout=120) as client:
+        with client.stream("GET", download_url) as stream:
+            stream.raise_for_status()
+            with open(dest_path, "wb") as f:
+                for chunk in stream.iter_bytes(chunk_size=8192):
+                    f.write(chunk)
+
+    return json.dumps(
+        {"path": str(dest_path), "filename": filename, "size": file_size},
+        ensure_ascii=False,
+    )
 
 
 # ---------------------------------------------------------------------------

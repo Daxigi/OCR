@@ -53,6 +53,8 @@ services:
       - "8001:8001"
     volumes:
       - pdf_storage:/pdfs
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
     networks:
       - rag_network
 

@@ -1,76 +1,80 @@
 # Proyecto: Agente RAG Telegram con OpenClaw
 
-## Stack Definitivo
+## Concepto Central
+
+Agente de Telegram que construye una **base de conocimiento incremental** a partir de PDFs. Cada documento que se ingesta se suma al corpus total en Qdrant. Las preguntas del usuario se responden buscando en **la totalidad de los documentos ingestados**, no en un PDF individual. Es una memoria acumulativa que crece con cada documento.
+
+## Stack
 
 - **LLM**: Mistral Nemo 12B (`mistral-nemo:latest` vía Ollama)
 - **Embeddings**: `intfloat/multilingual-e5-large` (fallback: `BAAI/bge-m3`)
-- **Vector DB**: Qdrant (open-source, Docker)
+- **Vector DB**: Qdrant (colección `documents`, vectores 1024 dims, cosine similarity)
 - **RAG Framework**: LlamaIndex
-- **Agent Gateway**: OpenClaw (conecta Telegram ↔ LLM ↔ herramientas)
-- **Protocolo**: MCP (Model Context Protocol) para PDF tools y RAG engine
-- **Infraestructura**: Docker + Docker Compose (local primero, hostear después)
+- **Agent Gateway**: OpenClaw
+- **Protocolo**: MCP (Model Context Protocol)
+- **Infra**: Docker Compose (5 contenedores)
 - **Canal**: Telegram Bot API
 
-## Arquitectura
+## Los 5 Contenedores (estado actual)
+
+### 1. ollama (LLM) ✅ Construido
+- Mistral Nemo 12B con GPU passthrough NVIDIA
+- API OpenAI-compatible en `http://ollama:11434/v1`
+- Volumen: `ollama_data`
+
+### 2. qdrant (Vector DB) ✅ Construido
+- Colección `documents`, vectores 1024 dims, cosine similarity
+- Puertos: 6333 (HTTP), 6334 (gRPC)
+- Volumen: `qdrant_data`
+
+### 3. mcp-pdf-tools (puerto 8001) ✅ Construido
+MCP server con 3 tools:
+- `extract_text(path)` → PyMuPDF nativo, Tesseract OCR fallback (esp + eng)
+- `extract_tables(path)` → pdfplumber, JSON por página
+- `analyze_document(path)` → combina ambos + metadata (nombre, páginas, word count)
+
+### 4. mcp-rag-engine (puerto 8002) ✅ Construido
+MCP server con 4 tools:
+- `ingest_document(text, metadata)` → chunks (1000 chars, 200 overlap) → embeddings multilingual-e5-large → Qdrant
+- `search_documents(query, top_k=5)` → embedding de query → búsqueda semántica en TODO el corpus → top K chunks con score
+- `list_documents()` → lista docs únicos en la BD
+- `delete_document(doc_id)` → elimina chunks de un documento
+
+### 5. openclaw (gateway, puerto 8080) ✅ Construido
+- Conecta Telegram ↔ Mistral ↔ MCP servers
+- Restringido a un user ID de Telegram
+- System prompt con instrucciones de uso de herramientas
+- Flujo: PDF → extrae → ingesta → confirma / Pregunta → busca en TODO el corpus → responde
+
+## Flujo de Ingesta (incremental)
 
 ```
-Usuario Telegram
-    ↓
-OpenClaw (gateway + memoria)
-    ↓
-Mistral Nemo 12B (Ollama, OpenAI-compatible API)
-    ↓ MCP
-┌─────────────┐    ┌──────────────┐
-│ MCP Server   │    │ MCP Server    │
-│ pdf-tools    │    │ rag-engine    │
-│              │    │               │
-│ PyMuPDF      │    │ LlamaIndex    │
-│ pdfplumber   │    │ multilingual  │
-│ Tesseract    │    │   -e5-large   │
-│              │    │ Qdrant        │
-└─────────────┘    └──────────────┘
+PDF 1 → extract → chunk → embed → Qdrant [doc1_chunk1, doc1_chunk2, ...]
+PDF 2 → extract → chunk → embed → Qdrant [doc1_chunk1, ..., doc2_chunk1, doc2_chunk2, ...]
+PDF N → extract → chunk → embed → Qdrant [todos los chunks de todos los docs]
 ```
 
-## Servicios Docker Compose
+Cada documento se identifica por metadata (nombre, fecha de ingesta, páginas). Los chunks se acumulan. La búsqueda semántica recorre TODOS los chunks de TODOS los documentos y devuelve los más relevantes independientemente de qué PDF vinieron.
 
-1. **ollama** - Sirve Mistral Nemo 12B (GPU passthrough)
-2. **qdrant** - Vector DB persistente
-3. **openclaw** - Gateway + Telegram + memoria
-4. **mcp-pdf-tools** - Extracción de texto/OCR de PDFs (PyMuPDF + pdfplumber + Tesseract)
-5. **mcp-rag-engine** - Pipeline RAG (LlamaIndex + multilingual-e5-large + Qdrant client)
+## Flujo de Consulta (cross-document)
 
-## Flujo Principal
+```
+Usuario: "¿Qué dice sobre las cláusulas de terminación?"
+    → search_documents("cláusulas de terminación", top_k=5)
+    → Qdrant devuelve 5 chunks (pueden ser de distintos PDFs)
+    → Cada chunk incluye metadata: de qué documento viene
+    → Mistral genera respuesta citando las fuentes:
+      "Según [Contrato_A.pdf], ... Además, en [Contrato_B.pdf]..."
+```
 
-### Ingesta (usuario envía PDF):
-1. OpenClaw recibe PDF vía Telegram → guarda en volumen compartido
-2. MCP `pdf-tools` → `analyze_document(path)` → extrae texto (PyMuPDF nativo o Tesseract OCR) + tablas (pdfplumber)
-3. MCP `rag-engine` → `ingest_document(texto, metadata)` → LlamaIndex chunking (1000 chars, 200 overlap) → embeddings multilingual-e5-large → almacena en Qdrant
-4. Bot confirma: "Documento procesado. ¿Qué querés saber?"
+## Lo que FALTA implementar
 
-### Consulta (usuario hace pregunta):
-1. MCP `rag-engine` → `search_documents(query)` → embedding de query → búsqueda semántica Qdrant → top 5 chunks
-2. Mistral Nemo genera respuesta con chunks como contexto
-3. Respuesta → Telegram
-
-## MCP Tools a implementar
-
-### pdf-tools:
-- `extract_text(path)` → texto plano del PDF
-- `extract_tables(path)` → tablas en JSON
-- `analyze_document(path)` → texto + tablas + metadata completa
-
-### rag-engine:
-- `ingest_document(text, metadata)` → chunking + embedding + store en Qdrant
-- `search_documents(query, top_k=5)` → búsqueda semántica
-- `list_documents()` → documentos ingestados
-- `delete_document(doc_id)` → eliminar documento de Qdrant
-
-## Configuración OpenClaw
-- Provider: Ollama (http://ollama:11434/v1)
-- Modelo: mistral-nemo:latest
-- Canal: Telegram (restringido a mi user ID)
-- Memoria: MEMORY.md + daily notes + memory flush pre-compactación
-- MCP Servers: pdf-tools (SSE) + rag-engine (SSE)
+| # | Pendiente | Detalle |
+|---|-----------|---------|
+| 1 | **Recepción de PDF de Telegram** | OpenClaw debe interceptar el archivo que envía el usuario por Telegram, descargarlo y guardarlo en `/pdfs` (volumen compartido). Actualmente no está implementada esta lógica. |
+| 2 | **Validación del config.yaml de OpenClaw** | Verificar que el config.yaml es compatible con la versión real de OpenClaw/AgentGateway instalada. |
+| 3 | **Pull automático del modelo** | `mistral-nemo:latest` se debe bajar manualmente con `docker exec ollama ollama pull mistral-nemo`. Automatizar en el entrypoint o init container. |
+| 4 | **Health checks entre servicios** | No hay health checks. Los servicios pueden intentar conectarse antes de que los demás estén listos. |
 
 ## Variables de entorno (.env)
 ```
@@ -81,16 +85,9 @@ QDRANT_HOST=http://qdrant:6333
 EMBEDDING_MODEL=intfloat/multilingual-e5-large
 ```
 
-## Requisitos locales
-- Docker Desktop con GPU support (NVIDIA Container Toolkit)
-- GPU con 12GB+ VRAM (RTX 3060/3070/3080/3090/4060/4070/4080/4090)
-- 16GB+ RAM sistema
-- 20GB+ disco libre
-
-## Notas
-- Mistral Nemo 12B necesita ~7GB VRAM en Q4, cabe en cualquier GPU de 12GB+
-- multilingual-e5-large corre en CPU sin problemas (~1.2GB RAM)
-- Qdrant es liviano, corre sin GPU
-- Idiomas: español e inglés
-- Tesseract: instalar paquetes spa + eng en el container
-- Local first, hostear después (la arquitectura Docker facilita mover a cloud)
+## Notas técnicas
+- Mistral Nemo 12B: ~7GB VRAM (Q4), cabe en GPU 12GB+
+- multilingual-e5-large: corre en CPU (~1.2GB RAM)
+- Qdrant: liviano, sin GPU
+- Idiomas: español + inglés
+- Local primero, hostear después (Docker facilita migración)

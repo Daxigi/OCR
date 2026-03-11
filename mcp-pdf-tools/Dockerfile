@@ -16,7 +16,8 @@ RUN pip install --no-cache-dir \
     mcp \
     pymupdf \
     pdfplumber \
-    pillow
+    pillow \
+    httpx
 
 COPY server.py .
 
