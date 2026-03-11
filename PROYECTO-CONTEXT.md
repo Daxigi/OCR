@@ -15,6 +15,23 @@ Agente de Telegram que construye una **base de conocimiento incremental** a part
 - **Infra**: Docker Compose (5 contenedores)
 - **Canal**: Telegram Bot API
 
+## Rol de LlamaIndex en el proyecto
+
+LlamaIndex es un framework de Python para construir aplicaciones RAG. Se usa como **motor interno del contenedor mcp-rag-engine**, NO como reemplazo del pipeline completo. Distribución de responsabilidades:
+
+- **mcp-pdf-tools** → Extracción de texto/OCR (PyMuPDF + pdfplumber + Tesseract). Se mantiene custom porque es más completo que los readers de LlamaIndex para PDFs escaneados.
+- **mcp-rag-engine (usa LlamaIndex internamente)** → LlamaIndex maneja el chunking, embeddings, conexión con Qdrant y query engine. Beneficios: chunking semántico (SentenceSplitter), conector nativo Qdrant, soporte directo para multilingual-e5-large y Ollama como LLM, y funcionalidades avanzadas como re-ranking y query transformations.
+
+Componentes de LlamaIndex que se usan:
+- `llama_index.core` → VectorStoreIndex, Settings, ServiceContext
+- `llama_index.vector_stores.qdrant` → QdrantVectorStore
+- `llama_index.embeddings.huggingface` → HuggingFaceEmbedding (multilingual-e5-large)
+- `llama_index.llms.ollama` → Ollama (Mistral Nemo 12B)
+- `llama_index.core.node_parser` → SentenceSplitter (chunking)
+- `llama_index.core.schema` → Document, TextNode (para inyectar texto desde mcp-pdf-tools)
+
+Lo que NO se usa de LlamaIndex: sus readers/loaders de PDF (SimpleDirectoryReader, etc.), porque mcp-pdf-tools ya tiene una implementación superior con OCR + tablas.
+
 ## Los 5 Contenedores (estado actual)
 
 ### 1. ollama (LLM) ✅ Construido
@@ -34,11 +51,11 @@ MCP server con 3 tools:
 - `analyze_document(path)` → combina ambos + metadata (nombre, páginas, word count)
 
 ### 4. mcp-rag-engine (puerto 8002) ✅ Construido
-MCP server con 4 tools:
-- `ingest_document(text, metadata)` → chunks (1000 chars, 200 overlap) → embeddings multilingual-e5-large → Qdrant
-- `search_documents(query, top_k=5)` → embedding de query → búsqueda semántica en TODO el corpus → top K chunks con score
-- `list_documents()` → lista docs únicos en la BD
-- `delete_document(doc_id)` → elimina chunks de un documento
+MCP server con 4 tools. **Usa LlamaIndex internamente** para chunking, embeddings y búsqueda:
+- `ingest_document(text, metadata)` → LlamaIndex SentenceSplitter (chunk_size=1024, overlap=200) → HuggingFaceEmbedding (multilingual-e5-large) → QdrantVectorStore
+- `search_documents(query, top_k=5)` → LlamaIndex VectorStoreIndex.as_query_engine() → búsqueda semántica en TODO el corpus → top K chunks con score + metadata de origen
+- `list_documents()` → lista docs únicos en la BD vía Qdrant client
+- `delete_document(doc_id)` → elimina chunks de un documento vía Qdrant client
 
 ### 5. openclaw (gateway, puerto 8080) ✅ Construido
 - Conecta Telegram ↔ Mistral ↔ MCP servers
@@ -91,3 +108,6 @@ EMBEDDING_MODEL=intfloat/multilingual-e5-large
 - Qdrant: liviano, sin GPU
 - Idiomas: español + inglés
 - Local primero, hostear después (Docker facilita migración)
+- LlamaIndex: se usa SOLO dentro de mcp-rag-engine, no reemplaza mcp-pdf-tools
+- Dependencias pip del mcp-rag-engine: `llama-index-core`, `llama-index-vector-stores-qdrant`, `llama-index-embeddings-huggingface`, `llama-index-llms-ollama`, `qdrant-client`, `mcp`
+- Dependencias pip del mcp-pdf-tools: `PyMuPDF`, `pdfplumber`, `pytesseract`, `pdf2image`, `Pillow`, `mcp`

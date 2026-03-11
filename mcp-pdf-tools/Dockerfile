@@ -14,6 +14,7 @@ WORKDIR /app
 # Python dependencies
 RUN pip install --no-cache-dir \
     mcp \
+    uvicorn \
     pymupdf \
     pdfplumber \
     pillow \

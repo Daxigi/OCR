@@ -232,4 +232,5 @@ def download_telegram_file(file_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run(transport="sse", host="0.0.0.0", port=8001)
+    import uvicorn
+    uvicorn.run(mcp.sse_app(), host="0.0.0.0", port=8001)

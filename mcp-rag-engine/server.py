@@ -1,7 +1,8 @@
 """
 MCP RAG Engine Server
 Provides document ingestion, semantic search, listing, and deletion backed by
-Qdrant vector storage and HuggingFace embeddings.
+Qdrant vector storage. Uses LlamaIndex internally for chunking, embeddings,
+and query synthesis via Ollama.
 Transport: SSE on port 8002
 """
 
@@ -10,10 +11,11 @@ import os
 import uuid
 from typing import Any
 
-from llama_index.core import Document, VectorStoreIndex
+from llama_index.core import Document, Settings, VectorStoreIndex
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.storage.storage_context import StorageContext
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from mcp.server.fastmcp import FastMCP
 from qdrant_client import QdrantClient
@@ -30,6 +32,8 @@ from qdrant_client.http.models import (
 # ---------------------------------------------------------------------------
 
 QDRANT_HOST: str = os.environ.get("QDRANT_HOST", "http://qdrant:6333")
+OLLAMA_HOST: str = os.environ.get("OLLAMA_HOST", "http://ollama:11434")
+OLLAMA_MODEL: str = os.environ.get("OLLAMA_MODEL", "mistral-nemo:latest")
 EMBEDDING_MODEL: str = os.environ.get(
     "EMBEDDING_MODEL", "intfloat/multilingual-e5-large"
 )
@@ -39,16 +43,28 @@ COLLECTION_NAME = "documents"
 EMBEDDING_DIM = 1024
 
 # ---------------------------------------------------------------------------
-# Initialise shared resources at module level so every tool call reuses them
+# LlamaIndex global Settings
+# Configure once at module level so all index/retriever/query-engine calls
+# inherit the same embed_model and llm automatically.
 # ---------------------------------------------------------------------------
 
 print(f"Loading embedding model: {EMBEDDING_MODEL}")
-embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL)
+Settings.embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL)
 print("Embedding model loaded.")
+
+Settings.llm = Ollama(
+    model=OLLAMA_MODEL,
+    base_url=OLLAMA_HOST,
+    request_timeout=120.0,
+)
+print(f"LLM configured: {OLLAMA_MODEL} @ {OLLAMA_HOST}")
+
+# ---------------------------------------------------------------------------
+# Qdrant + LlamaIndex vector store
+# ---------------------------------------------------------------------------
 
 qdrant_client = QdrantClient(url=QDRANT_HOST)
 
-# Ensure the collection exists
 existing = [c.name for c in qdrant_client.get_collections().collections]
 if COLLECTION_NAME not in existing:
     qdrant_client.create_collection(
@@ -65,8 +81,8 @@ vector_store = QdrantVectorStore(
 )
 storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-# SentenceSplitter is stateless – create once and reuse
-splitter = SentenceSplitter(chunk_size=1000, chunk_overlap=200)
+# SentenceSplitter is stateless — create once and reuse
+splitter = SentenceSplitter(chunk_size=1024, chunk_overlap=200)
 
 # ---------------------------------------------------------------------------
 # MCP server
@@ -85,10 +101,9 @@ def ingest_document(text: str, metadata: dict) -> str:
     """
     Chunk, embed, and store a document in Qdrant.
 
-    The document is split with SentenceSplitter (chunk_size=1000,
-    chunk_overlap=200), each chunk is embedded with the configured
-    HuggingFace model, and all vectors are upserted into the "documents"
-    collection.
+    The document is split with SentenceSplitter (chunk_size=1024,
+    chunk_overlap=200), each chunk is embedded with multilingual-e5-large,
+    and all vectors are upserted into the "documents" collection.
 
     Args:
         text    : Full text content of the document.
@@ -104,19 +119,15 @@ def ingest_document(text: str, metadata: dict) -> str:
 
     doc_id: str = metadata["doc_id"]
 
-    # Build a LlamaIndex Document and split it into nodes
     document = Document(text=text, metadata=metadata, id_=doc_id)
     nodes = splitter.get_nodes_from_documents([document])
 
-    # Tag every node with the doc_id so we can filter/delete by it later
     for node in nodes:
         node.metadata["doc_id"] = doc_id
 
-    # Build a temporary index that writes directly to our vector_store
     VectorStoreIndex(
         nodes,
         storage_context=storage_context,
-        embed_model=embed_model,
         show_progress=False,
     )
 
@@ -126,7 +137,11 @@ def ingest_document(text: str, metadata: dict) -> str:
 @mcp.tool()
 def search_documents(query: str, top_k: int = 5) -> str:
     """
-    Perform a semantic search against stored documents.
+    Perform a semantic search against all stored documents.
+
+    Returns the top-K most relevant chunks with their scores and source
+    metadata. The caller (OpenClaw) uses these chunks to synthesize the
+    final answer with the LLM.
 
     Args:
         query : Natural-language query string.
@@ -136,10 +151,7 @@ def search_documents(query: str, top_k: int = 5) -> str:
         JSON string: list of objects with keys "score", "text", and
         "metadata" for each matching chunk.
     """
-    index = VectorStoreIndex.from_vector_store(
-        vector_store=vector_store,
-        embed_model=embed_model,
-    )
+    index = VectorStoreIndex.from_vector_store(vector_store=vector_store)
     retriever = index.as_retriever(similarity_top_k=top_k)
     nodes_with_scores = retriever.retrieve(query)
 
@@ -165,7 +177,6 @@ def list_documents() -> str:
         JSON string: list of objects with keys "doc_id" and any other
         metadata fields present on the first chunk of each document.
     """
-    # Scroll through all points and collect unique doc_ids
     offset = None
     seen_doc_ids: set[str] = set()
     documents: list[dict[str, Any]] = []
@@ -180,9 +191,6 @@ def list_documents() -> str:
         )
         for point in response:
             payload = point.payload or {}
-            # LlamaIndex stores node metadata under the "_node_content" key
-            # as well as directly on the payload depending on the version.
-            # Try both locations.
             meta: dict = payload.get("metadata", payload)
             doc_id = meta.get("doc_id")
             if doc_id and doc_id not in seen_doc_ids:
@@ -228,4 +236,5 @@ def delete_document(doc_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run(transport="sse", host="0.0.0.0", port=8002)
+    import uvicorn
+    uvicorn.run(mcp.sse_app(), host="0.0.0.0", port=8002)
