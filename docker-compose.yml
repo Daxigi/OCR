@@ -77,7 +77,7 @@ services:
 
   # ── OpenClaw / AgentGateway ───────────────────────────────────────────────
   openclaw:
-    image: agentgateway/agentgateway:latest
+    image: ghcr.io/agentgateway/agentgateway:latest
     container_name: openclaw
     restart: unless-stopped
     ports:
